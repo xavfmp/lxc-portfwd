@@ -1,0 +1,13 @@
+[Unit]
+Description=LXC port forwarding (DNAT) rules
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/lxc-portfwd apply
+ExecStop=/usr/local/bin/lxc-portfwd flush
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

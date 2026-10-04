@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+#
+# lxc-portfwd - port forwarding (DNAT) from a host's public IP to containers
+# on a private bridge, e.g. LXC/VMs on a Proxmox box that has a single public
+# IPv4 address.
+#
+# Usage:
+#   lxc-portfwd add <public_port> <ct_ip> [ct_port] [tcp|udp|both] [comment]
+#   lxc-portfwd del <public_port> [tcp|udp|both]
+#   lxc-portfwd list
+#   lxc-portfwd apply      # rebuild the iptables rules from the config file
+#   lxc-portfwd flush      # remove every rule and chain created by this tool
+#
+# Rules live in a plain config file (one per line, "proto:port:ct_ip:ct_port:comment")
+# and are rebuilt from it at boot by a systemd unit. Only dedicated iptables
+# chains are touched, so your other firewall rules are left alone.
+#
+# Environment overrides:
+#   CONF      config file                  (default /etc/lxc-portfwd.conf)
+#   WAN_IF    public interface             (default vmbr0)
+#   LAN_NET   private network (CIDR)       (default 10.10.10.0/24)
+
+set -euo pipefail
+
+CONF="${CONF:-/etc/lxc-portfwd.conf}"
+WAN_IF="${WAN_IF:-vmbr0}"
+LAN_NET="${LAN_NET:-10.10.10.0/24}"
+NAT_CHAIN="LXC_PORTFWD"
+FWD_CHAIN="LXC_PORTFWD_FWD"
+MASQ_CHAIN="LXC_PORTFWD_MASQ"
+HAIRPIN_MARK="0x2a"
+
+touch "$CONF"
+
+wan_ip() {
+  ip -4 addr show "$WAN_IF" | awk '/inet /{print $2}' | cut -d/ -f1 | head -1
+}
+
+usage() {
+  cat <<USAGE
+Usage:
+  $(basename "$0") add <public_port> <ct_ip> [ct_port] [tcp|udp|both] [comment]
+  $(basename "$0") del <public_port> [tcp|udp|both]
+  $(basename "$0") list
+  $(basename "$0") apply
+  $(basename "$0") flush
+
+Examples:
+  $(basename "$0") add 80 10.10.10.100 80 tcp "web http"
+  $(basename "$0") add 443 10.10.10.100 443 tcp "web https"
+  $(basename "$0") add 2222 10.10.10.101 22 tcp "ssh to a container"
+  $(basename "$0") del 80 tcp
+USAGE
+  exit 1
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+check_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )) || die "invalid port: $1"; }
+check_ip() {
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || die "invalid IPv4 address: $1"
+  local o; for o in "${BASH_REMATCH[@]:1}"; do (( o <= 255 )) || die "invalid IPv4 address: $1"; done
+}
+
+expand_proto() {
+  case "$1" in
+    both) echo "tcp udp" ;;
+    tcp|udp) echo "$1" ;;
+    *) echo "tcp" ;;
+  esac
+}
+
+ensure_chains() {
+  iptables -t nat -N "$NAT_CHAIN" 2>/dev/null || true
+  iptables -t filter -N "$FWD_CHAIN" 2>/dev/null || true
+  iptables -t nat -N "$MASQ_CHAIN" 2>/dev/null || true
+
+  iptables -t nat -C PREROUTING -j "$NAT_CHAIN" 2>/dev/null || \
+    iptables -t nat -I PREROUTING -j "$NAT_CHAIN"
+
+  iptables -t filter -C FORWARD -j "$FWD_CHAIN" 2>/dev/null || \
+    iptables -t filter -I FORWARD -j "$FWD_CHAIN"
+
+  # Dedicated chain for hairpin NAT: when a container reaches another one
+  # through the public IP, the reply must be masqueraded too. Otherwise it goes
+  # straight back inside and the client drops it (it never opened a connection
+  # to the container's private IP) -> timeout.
+  iptables -t nat -C POSTROUTING -j "$MASQ_CHAIN" 2>/dev/null || \
+    iptables -t nat -I POSTROUTING -j "$MASQ_CHAIN"
+}
+
+apply_rules() {
+  ensure_chains
+  iptables -t nat -F "$NAT_CHAIN"
+  iptables -t filter -F "$FWD_CHAIN"
+  iptables -t nat -F "$MASQ_CHAIN"
+
+  local pub_ip
+  pub_ip="$(wan_ip)"
+
+  # NB: declare every variable read by `read` as local, otherwise bash's
+  # dynamic scoping lets a nested `read` clobber a caller's variables.
+  local proto pub_port ct_ip ct_port comment p
+  while IFS=: read -r proto pub_port ct_ip ct_port comment; do
+    [[ -z "${proto:-}" || "$proto" == \#* ]] && continue
+    for p in $(expand_proto "$proto"); do
+      iptables -t nat -A "$NAT_CHAIN" -i "$WAN_IF" -p "$p" --dport "$pub_port" \
+        -j DNAT --to-destination "${ct_ip}:${ct_port}"
+      iptables -t filter -A "$FWD_CHAIN" -p "$p" -d "$ct_ip" --dport "$ct_port" -j ACCEPT
+
+      if [[ -n "$pub_ip" ]]; then
+        # Hairpin: a container on $LAN_NET calling $pub_ip:$pub_port (e.g. a
+        # public hostname resolved from inside) is DNATed to the target, and
+        # its connection is marked so POSTROUTING masquerades it.
+        iptables -t nat -A "$NAT_CHAIN" -s "$LAN_NET" -d "$pub_ip" -p "$p" --dport "$pub_port" \
+          -j CONNMARK --set-mark "$HAIRPIN_MARK"
+        iptables -t nat -A "$NAT_CHAIN" -s "$LAN_NET" -d "$pub_ip" -p "$p" --dport "$pub_port" \
+          -j DNAT --to-destination "${ct_ip}:${ct_port}"
+      fi
+    done
+  done < "$CONF"
+
+  if [[ -n "$pub_ip" ]]; then
+    iptables -t nat -A "$MASQ_CHAIN" -s "$LAN_NET" -m connmark --mark "$HAIRPIN_MARK" -j MASQUERADE
+  fi
+}
+
+flush_rules() {
+  iptables -t nat -D PREROUTING -j "$NAT_CHAIN" 2>/dev/null || true
+  iptables -t filter -D FORWARD -j "$FWD_CHAIN" 2>/dev/null || true
+  iptables -t nat -D POSTROUTING -j "$MASQ_CHAIN" 2>/dev/null || true
+  local c
+  for c in "nat $NAT_CHAIN" "filter $FWD_CHAIN" "nat $MASQ_CHAIN"; do
+    # shellcheck disable=SC2086
+    set -- $c
+    iptables -t "$1" -F "$2" 2>/dev/null || true
+    iptables -t "$1" -X "$2" 2>/dev/null || true
+  done
+  echo "All lxc-portfwd rules and chains removed (the config file is kept)."
+}
+
+cmd_add() {
+  local pub_port="${1:?public port required}"
+  local ct_ip="${2:?container IP required}"
+  local ct_port="${3:-$pub_port}"
+  local proto="${4:-tcp}"
+  local comment="${5:-}"
+
+  check_port "$pub_port"; check_ip "$ct_ip"; check_port "$ct_port"
+  case "$proto" in tcp|udp|both) ;; *) die "invalid protocol: $proto (tcp|udp|both)" ;; esac
+  comment="${comment//$'\n'/ }"
+
+  # drop an existing rule on the same port/proto first
+  cmd_del "$pub_port" "$proto" >/dev/null 2>&1 || true
+
+  echo "${proto}:${pub_port}:${ct_ip}:${ct_port}:${comment}" >> "$CONF"
+  apply_rules
+  echo "Added: ${proto} ${pub_port} -> ${ct_ip}:${ct_port} ${comment:+(${comment})}"
+}
+
+cmd_del() {
+  local pub_port="${1:?public port required}"
+  local proto="${2:-}"
+
+  local tmp
+  tmp="$(mktemp)"
+  awk -F: -v port="$pub_port" -v proto="$proto" '
+    $2 == port && (proto == "" || $1 == proto) { next }
+    { print }
+  ' "$CONF" > "$tmp"
+  cat "$tmp" > "$CONF"; rm -f "$tmp"
+  apply_rules
+  echo "Removed: rule(s) for public port ${pub_port} ${proto:+(${proto})}"
+}
+
+cmd_list() {
+  printf "%-6s %-10s %-16s %-8s %s\n" "PROTO" "PUB_PORT" "CT_IP" "CT_PORT" "COMMENT"
+  local proto pub_port ct_ip ct_port comment
+  while IFS=: read -r proto pub_port ct_ip ct_port comment; do
+    [[ -z "${proto:-}" || "$proto" == \#* ]] && continue
+    printf "%-6s %-10s %-16s %-8s %s\n" "$proto" "$pub_port" "$ct_ip" "$ct_port" "$comment"
+  done < "$CONF"
+}
+
+case "${1:-}" in
+  add)   shift; cmd_add "$@" ;;
+  del)   shift; cmd_del "$@" ;;
+  list)  cmd_list ;;
+  apply) apply_rules; echo "Rules applied." ;;
+  flush) flush_rules ;;
+  *) usage ;;
+esac

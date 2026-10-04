@@ -1,0 +1,5 @@
+# proto:public_port:ct_ip:ct_port:comment
+tcp:80:10.10.10.100:80:reverse proxy http
+tcp:443:10.10.10.100:443:reverse proxy https
+tcp:2222:10.10.10.101:22:ssh to a container
+both:51820:10.10.10.102:51820:wireguard
